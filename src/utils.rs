@@ -1,9 +1,211 @@
 use std::io::{self, Read, Write};
-use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+// ─── Cross-platform SO_REUSEPORT ──────────────────────────────────────────
+
+/// Set SO_REUSEPORT on a socket.
+///
+/// | Platform            | Implementation                          |
+/// |---------------------|-----------------------------------------|
+/// | Linux glibc         | socket2 `set_reuse_port`                |
+/// | Linux musl          | raw `libc::setsockopt(SO_REUSEPORT)`    |
+/// | macOS / iOS / BSD   | raw `libc::setsockopt(SO_REUSEPORT)`    |
+/// | Windows             | WinSock `setsockopt(SO_REUSEPORT=0x200)`|
+pub fn socket_set_reuse_port(sock: &Socket) -> io::Result<()> {
+    // Linux glibc: delegate to socket2 (no unsafe needed)
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    {
+        return sock.set_reuse_port(true);
+    }
+
+    // Unix (musl, macOS, FreeBSD, …): raw libc setsockopt
+    #[cfg(all(unix, not(all(target_os = "linux", not(target_env = "musl")))))]
+    {
+        use std::os::fd::AsRawFd;
+        let optval: libc::c_int = 1;
+        let rc = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        return if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+    }
+
+    // Windows: SO_REUSEPORT = 0x0200 (supported since Windows 10 1703 for UDP;
+    // for TCP SO_REUSEADDR already provides equivalent semantics)
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        const SO_REUSEPORT: i32 = 0x0200;
+        const SOL_SOCKET: i32 = 0xffff;
+        extern "system" {
+            fn setsockopt(
+                s: usize,
+                level: i32,
+                optname: i32,
+                optval: *const u8,
+                optlen: i32,
+            ) -> i32;
+        }
+        let optval: u32 = 1;
+        let rc = unsafe {
+            setsockopt(
+                sock.as_raw_socket() as usize,
+                SOL_SOCKET,
+                SO_REUSEPORT,
+                &optval as *const _ as *const u8,
+                std::mem::size_of::<u32>() as i32,
+            )
+        };
+        return if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+    }
+
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+// ─── Cross-platform bind_device ───────────────────────────────────────────
+
+/// Bind a socket to a specific network interface by name.
+///
+/// | Platform          | System call / option                              |
+/// |-------------------|---------------------------------------------------|
+/// | Linux glibc       | socket2 `bind_device` (`SO_BINDTODEVICE`)         |
+/// | Linux musl        | raw `libc::setsockopt(SO_BINDTODEVICE=25)`        |
+/// | macOS / iOS       | `if_nametoindex` + `IP_BOUND_IF`                  |
+/// | Windows           | `IP_UNICAST_IF` with adapter index                |
+pub fn socket_bind_device(sock: &Socket, iface: &str) -> io::Result<()> {
+    // Linux glibc: delegate to socket2
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    {
+        return sock.bind_device(Some(iface.as_bytes()));
+    }
+
+    // Linux musl: SO_BINDTODEVICE = 25, raw libc call
+    #[cfg(all(target_os = "linux", target_env = "musl"))]
+    {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        const SO_BINDTODEVICE: libc::c_int = 25;
+        let iface_c = CString::new(iface).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "interface name contains null byte")
+        })?;
+        let rc = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                SO_BINDTODEVICE,
+                iface_c.as_ptr() as *const libc::c_void,
+                iface_c.to_bytes_with_nul().len() as libc::socklen_t,
+            )
+        };
+        return if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+    }
+
+    // macOS / BSD: get interface index via if_nametoindex, then IP_BOUND_IF
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        let iface_c = CString::new(iface).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "interface name contains null byte")
+        })?;
+        let idx = unsafe { libc::if_nametoindex(iface_c.as_ptr()) };
+        if idx == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("interface '{}' not found", iface),
+            ));
+        }
+        let idx = idx as libc::c_int;
+        let rc = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_BOUND_IF,
+                &idx as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        return if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+    }
+
+    // Windows: IP_UNICAST_IF (31) with adapter index
+    #[cfg(windows)]
+    {
+        use std::ffi::CString;
+        use std::os::windows::io::AsRawSocket;
+        extern "system" {
+            fn if_nametoindex(ifname: *const u8) -> u32;
+            fn setsockopt(
+                s: usize,
+                level: i32,
+                optname: i32,
+                optval: *const u8,
+                optlen: i32,
+            ) -> i32;
+        }
+        const IPPROTO_IP: i32 = 0;
+        const IP_UNICAST_IF: i32 = 31;
+        let iface_c = CString::new(iface).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "interface name contains null byte")
+        })?;
+        let idx = unsafe { if_nametoindex(iface_c.as_ptr() as *const u8) };
+        if idx == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("interface '{}' not found", iface),
+            ));
+        }
+        // IP_UNICAST_IF expects the index in network byte order
+        let idx_be = idx.to_be();
+        let rc = unsafe {
+            setsockopt(
+                sock.as_raw_socket() as usize,
+                IPPROTO_IP,
+                IP_UNICAST_IF,
+                &idx_be as *const _ as *const u8,
+                std::mem::size_of::<u32>() as i32,
+            )
+        };
+        return if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+    }
+
+    #[allow(unreachable_code)]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Binding to a specific interface is not supported on this platform.",
+    ))
+}
+
+// ─── socket_set_opt ───────────────────────────────────────────────────────
 
 /// Set socket options: reuse, bind, interface, timeout
 pub fn socket_set_opt(
@@ -15,24 +217,10 @@ pub fn socket_set_opt(
 ) -> io::Result<()> {
     if reuse {
         sock.set_reuse_address(true)?;
-        #[cfg(unix)]
-        {
-            sock.set_reuse_port(true)?;
-        }
+        socket_set_reuse_port(sock)?;
     }
     if let Some(iface) = interface {
-        #[cfg(target_os = "linux")]
-        {
-            sock.bind_device(Some(iface.as_bytes()))?;
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = iface;
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Binding to an interface is not supported on your platform.",
-            ));
-        }
+        socket_bind_device(sock, iface)?;
     }
     if let Some(addr) = bind_addr {
         sock.bind(&SockAddr::from(addr))?;
@@ -43,6 +231,7 @@ pub fn socket_set_opt(
     }
     Ok(())
 }
+
 
 /// Create a connected TCP socket with options
 pub fn create_tcp_socket(
@@ -229,15 +418,16 @@ pub fn is_closed_socket_err(err: &io::Error) -> bool {
 
 /// Safe wrapper for socket2 recv (handles MaybeUninit)
 pub fn socket_recv(sock: &Socket, buf: &mut [u8]) -> io::Result<usize> {
+    use std::mem::MaybeUninit;
     let buf_uninit: &mut [MaybeUninit<u8>] =
         unsafe { &mut *(buf as *mut [u8] as *mut [MaybeUninit<u8>]) };
     sock.recv(buf_uninit)
 }
 
 /// Safe wrapper for socket2 recv_from (handles MaybeUninit)
-pub fn socket_recv_from(sock: &Socket, buf: &mut [u8]) -> io::Result<(usize, SockAddr)> {
+pub fn socket_recv_from(sock: &Socket, buf: &mut [u8]) -> io::Result<(usize, socket2::SockAddr)> {
+    use std::mem::MaybeUninit;
     let buf_uninit: &mut [MaybeUninit<u8>] =
         unsafe { &mut *(buf as *mut [u8] as *mut [MaybeUninit<u8>]) };
     sock.recv_from(buf_uninit)
 }
-

@@ -156,10 +156,7 @@ fn extract_mapped_addr(payload: &[u8]) -> Option<(Ipv4Addr, u16)> {
 fn new_socket_reuse(sock_type: Type, protocol: Protocol) -> io::Result<Socket> {
     let sock = Socket::new(Domain::IPV4, sock_type, Some(protocol))?;
     sock.set_reuse_address(true)?;
-    #[cfg(unix)]
-    {
-        sock.set_reuse_port(true)?;
-    }
+    crate::utils::socket_set_reuse_port(&sock)?;
     Ok(sock)
 }
 

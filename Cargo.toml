@@ -8,7 +8,7 @@ license = "GPL-3.0"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 rand = "0.8"
 ctrlc = "3"
 colored = "2"

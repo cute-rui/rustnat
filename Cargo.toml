@@ -1,0 +1,30 @@
+[package]
+name = "rustnat"
+version = "2.2.1"
+edition = "2021"
+description = "Expose your TCP/UDP port behind full-cone NAT to the Internet."
+license = "GPL-3.0"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+socket2 = "0.5"
+rand = "0.8"
+ctrlc = "3"
+colored = "2"
+chrono = "0.4"
+regex = "1"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
+async-trait = "0.1"
+gotatun = { version = "0.4", features = ["device"] }
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

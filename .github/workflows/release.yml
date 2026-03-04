@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push: 
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use-cross: true
+            ext: ""
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use-cross: true
+            ext: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            use-cross: false
+            ext: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            use-cross: false
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            use-cross: false
+            ext: ".exe"
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            use-cross: false
+            ext: ".exe"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use-cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build with cross
+        if: matrix.use-cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build with cargo
+        if: ${{ !matrix.use-cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Release
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czvf ../../../rustnat-${{ matrix.target }}.tar.gz rustnat${{ matrix.ext }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustnat-${{ matrix.target }}
+          path: rustnat-${{ matrix.target }}.tar.gz
+          retention-days: 1
+
+      - name: Pre-release or Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: rustnat-${{ matrix.target }}.tar.gz
+          generate_release_notes: true

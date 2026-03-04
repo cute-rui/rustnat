@@ -1,0 +1,8 @@
+﻿cargo :     Updating `mirror` index
+所在位置 行:1 字符: 36
++ $ErrorActionPreference='Continue'; cargo build *>&1 | Out-File -FileP ...
++                                    ~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Updating `mirror` index:Stri
+    ng) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
